@@ -51,7 +51,7 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("ORCHESTRATOR_POLL: %w", err)
 	}
 
-	config.ShutdownTimeout, err = parseDurationEnv("SHUTDOWN_TIMEOUT", 150*time.Second)
+	config.ShutdownTimeout, err = parseDurationEnv("SHUTDOWN_TIMEOUT", 30*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("SHUTDOWN_TIMEOUT: %w", err)
 	}

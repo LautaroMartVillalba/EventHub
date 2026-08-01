@@ -168,6 +168,50 @@ func (repository *Repository) FetchByStatus(ctx context.Context, status domain.E
 }
 
 // ---------------------------------------------------------------------------
+// FetchAll
+// ---------------------------------------------------------------------------
+
+// FetchAll returns all events regardless of status, with processes populated.
+// Returns an empty slice when there are no events.
+func (repository *Repository) FetchAll(ctx context.Context) ([]domain.Event, error) {
+	rows, err := repository.db.QueryContext(ctx, `
+		SELECT id, type, payload, idempotency_key,
+		       status, attempts, next_retry_at,
+		       created_at, updated_at
+		FROM events
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("fetch all events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []domain.Event
+	for rows.Next() {
+		event, err := scanEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+
+	for i := range events {
+		processes, err := repository.loadProcesses(ctx, events[i].ID)
+		if err != nil {
+			return nil, fmt.Errorf("load processes for event %q: %w", events[i].ID, err)
+		}
+		events[i].Processes = processes
+	}
+
+	if events == nil {
+		return []domain.Event{}, nil
+	}
+	return events, nil
+}
+
+// ---------------------------------------------------------------------------
 // FetchByID
 // ---------------------------------------------------------------------------
 
@@ -276,7 +320,7 @@ func (repository *Repository) UpdateEventStatus(ctx context.Context, eventID str
 		}
 		affected, err := result.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("update status: %w", err.Error())
+			return fmt.Errorf("update status: %w", err)
 		}
 		if affected == 0 {
 			return fmt.Errorf("event %q: %w", eventID, ErrNotFound)
