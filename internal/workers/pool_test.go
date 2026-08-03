@@ -834,3 +834,36 @@ func TestPool_ProcessingError_PartialFailedUpdateErrors(t *testing.T) {
 	assert.Equal(t, domain.StatusProcessing, transitions[0])
 	assert.Equal(t, domain.StatusPartialFailed, transitions[1])
 }
+
+// ---------------------------------------------------------------------------
+// 21. Processor returns ErrEventDead (T11 FanOut dead-letter) →
+//     pool does NOT persist partial_failed, leaves dead status untouched.
+//     Failed() = 1, Processed() = 0, transitions = [processing] only.
+// ---------------------------------------------------------------------------
+
+func TestPool_ProcessorReturnsErrEventDead(t *testing.T) {
+	ch := make(chan domain.Event, 1)
+	proc := &fakeProcessor{
+		processFunc: func(ctx context.Context, event domain.Event) error {
+			return ErrEventDead
+		},
+	}
+	upd := &fakeStatusUpdater{transitions: make(map[string][]domain.EventStatus)}
+
+	pool := NewPool(1, ch, proc, upd)
+	ctx := silentCtxPool()
+	pool.Start(ctx)
+
+	ch <- domain.Event{ID: "ev-dead", Type: "test"}
+	pool.Shutdown()
+
+	// The event is counted as failed (ErrEventDead is an error).
+	assert.Equal(t, int64(1), pool.Failed(), "failed must be 1 — processor returned ErrEventDead")
+	assert.Equal(t, int64(0), pool.Processed(), "processed must be 0 — event was not completed")
+
+	// Transitions: only [processing] — no partial_failed (dead status is left untouched).
+	transitions := upd.Transitions("ev-dead")
+	require.Len(t, transitions, 1,
+		"only processing must be recorded; partial_failed must NOT be recorded for ErrEventDead")
+	assert.Equal(t, domain.StatusProcessing, transitions[0])
+}
