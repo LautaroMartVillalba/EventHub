@@ -5,6 +5,7 @@ package workers
 
 import (
 	"context"
+	"errors"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -19,9 +20,16 @@ import (
 // Keeping this seam lets the pool stay unchanged when the processor evolves.
 type EventProcessor interface {
 	// Process runs the event and returns nil on success or an error that
-	// marks the event as partially failed.
+	// marks the event as partially failed. A processor that already moved
+	// the event to the dead-letter queue returns ErrEventDead; the pool
+	// leaves the event's dead status untouched.
 	Process(ctx context.Context, event domain.Event) error
 }
+
+// ErrEventDead is returned by an EventProcessor when the event has already
+// been moved to the dead-letter queue (T11 FanOut). The pool recognises it
+// and does not overwrite the event's dead status with partial_failed.
+var ErrEventDead = errors.New("workers: event moved to dead letter")
 
 // EventStatusUpdater is the minimal persistence contract the Pool depends on
 // to record event status transitions. *storage.Repository satisfies it via
@@ -220,6 +228,13 @@ func (pool *Pool) processEvent(ctx context.Context, event domain.Event) {
 			"error", err,
 		)
 		pool.failed.Add(1)
+		if errors.Is(err, ErrEventDead) {
+			// The processor (T11 FanOut) already moved the event to the
+			// dead-letter queue and recorded status 'dead'; do not overwrite
+			// it with partial_failed (the dead status is required by the
+			// requeue API and the DLQ snapshot).
+			return
+		}
 		if updateErr := pool.statusUpdater.UpdateEventStatus(ctx, event.ID, domain.StatusPartialFailed); updateErr != nil {
 			logger.Error("worker failed to record partial failure",
 				"event_id", event.ID,
