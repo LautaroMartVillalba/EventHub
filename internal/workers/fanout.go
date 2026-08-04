@@ -13,12 +13,8 @@ import (
 	"eventhub/internal/dispatch"
 	"eventhub/internal/domain"
 	"eventhub/internal/logging"
+	"eventhub/internal/retry"
 )
-
-// fallbackBackoff is the retry delay used when the FanOut receives an empty
-// backoff schedule: a misconfigured fan-out still retries instead of
-// hammering the repository.
-const fallbackBackoff = 1 * time.Second
 
 // maxPanicStackBytes caps the stack trace embedded in a process failure's
 // error message, so the persisted error_msg stays bounded while keeping the
@@ -51,38 +47,35 @@ type FanOutRepository interface {
 // it without knowing about the registry or the repository. Every field is
 // set once by NewFanOut and never mutated afterwards.
 type FanOut struct {
-	registry        *dispatch.Registry
-	repo            FanOutRepository
-	maxAttempts     int
-	backoffSchedule []time.Duration
+	registry   *dispatch.Registry
+	repo       FanOutRepository
+	calculator *retry.Calculator
 }
 
 // NewFanOut returns a FanOut that dispatches the retryable processes of an
 // event to the handlers registered in registry, persisting status
 // transitions through repo.
 //
-// maxAttempts must be at least 1, and registry and repo must be non-nil;
-// otherwise NewFanOut panics. backoffSchedule may be empty: backoffFor falls
-// back to fallbackBackoff. Configuration supplies the values via
+// registry, repo and calculator must be non-nil; otherwise NewFanOut panics.
+// The calculator encapsulates the retry policy — the maximum attempt count
+// and the backoff schedule — so the FanOut itself neither reads nor parses
+// configuration: the caller builds the policy with retry.NewCalculator from
 // config.MaxAttempts (env MAX_ATTEMPTS, default 5) and
-// config.BackoffSchedule (env BACKOFF_SCHEDULE, default "2s,5s,15s,30s,60s")
-// — the FanOut itself does not read configuration, it receives the values as
-// arguments.
-func NewFanOut(registry *dispatch.Registry, repo FanOutRepository, maxAttempts int, backoffSchedule []time.Duration) *FanOut {
+// config.BackoffSchedule (env BACKOFF_SCHEDULE, default "2s,5s,15s,30s,60s").
+func NewFanOut(registry *dispatch.Registry, repo FanOutRepository, calculator *retry.Calculator) *FanOut {
 	if registry == nil {
 		panic("workers: registry must not be nil")
 	}
 	if repo == nil {
 		panic("workers: repo must not be nil")
 	}
-	if maxAttempts < 1 {
-		panic("workers: maxAttempts must be at least 1")
+	if calculator == nil {
+		panic("workers: calculator must not be nil")
 	}
 	return &FanOut{
-		registry:        registry,
-		repo:            repo,
-		maxAttempts:     maxAttempts,
-		backoffSchedule: backoffSchedule,
+		registry:   registry,
+		repo:       repo,
+		calculator: calculator,
 	}
 }
 
@@ -259,14 +252,15 @@ func (fanout *FanOut) runProcess(ctx context.Context, event domain.Event, dbProc
 }
 
 // handleProcessFailure records one failed attempt of a process and schedules
-// its retry: if the attempt count has reached maxAttempts the process is
-// marked dead (and the event will be dead-lettered); otherwise it is marked
-// failed with the next retry time computed from the backoff schedule. The
-// outcome flags are written through result's mutex.
+// its retry: if the calculator reports the attempt is not retryable (the
+// attempt count has reached maxAttempts) the process is marked dead (and the
+// event will be dead-lettered); otherwise it is marked failed with the next
+// retry time computed from the calculator's backoff schedule. The outcome
+// flags are written through result's mutex.
 func (fanout *FanOut) handleProcessFailure(ctx context.Context, event domain.Event, dbProcess domain.Process, errorMsg string, result *fanOutResult) {
 	newAttempts := dbProcess.Attempts + 1
 
-	if newAttempts >= fanout.maxAttempts {
+	if !fanout.calculator.ShouldRetry(newAttempts) {
 		if err := fanout.repo.UpdateProcessStatus(ctx, dbProcess.ID, domain.ProcessStatusDead, newAttempts, nil, errorMsg); err != nil {
 			logging.FromContext(ctx).Error("fanout: failed to mark process as dead",
 				"event_id", event.ID,
@@ -279,7 +273,7 @@ func (fanout *FanOut) handleProcessFailure(ctx context.Context, event domain.Eve
 		return
 	}
 
-	nextRetryAt := time.Now().UTC().Add(backoffFor(newAttempts, fanout.backoffSchedule))
+	nextRetryAt, _ := fanout.calculator.NextRetry(newAttempts)
 	if err := fanout.repo.UpdateProcessStatus(ctx, dbProcess.ID, domain.ProcessStatusFailed, newAttempts, &nextRetryAt, errorMsg); err != nil {
 		logging.FromContext(ctx).Error("fanout: failed to mark process as failed",
 			"event_id", event.ID,
@@ -331,24 +325,6 @@ func (result *fanOutResult) recordSkipped() {
 	result.mutex.Lock()
 	defer result.mutex.Unlock()
 	result.skipped++
-}
-
-// backoffFor returns the delay before the next retry of a failed process.
-// attempt is the 1-based number of the attempt that just failed: attempt 1
-// uses the first entry of schedule, attempt 2 the second, and so on, clamped
-// to the last entry for attempts beyond the schedule's length. An empty
-// schedule falls back to fallbackBackoff. The caller guarantees attempt >= 1
-// (newAttempts is always the previous attempts plus one), so out-of-range
-// low attempts are not clamped.
-func backoffFor(attempt int, schedule []time.Duration) time.Duration {
-	if len(schedule) == 0 {
-		return fallbackBackoff
-	}
-	index := attempt - 1
-	if index >= len(schedule) {
-		index = len(schedule) - 1
-	}
-	return schedule[index]
 }
 
 // briefStack returns the first maxPanicStackBytes bytes of a stack trace.
