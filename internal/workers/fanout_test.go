@@ -14,10 +14,22 @@ import (
 	"eventhub/internal/dispatch"
 	"eventhub/internal/domain"
 	"eventhub/internal/logging"
+	"eventhub/internal/retry"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// mustRetryCalculator builds a *retry.Calculator from a backoff schedule
+// string and maxAttempts, failing the test if the policy is invalid. A nil
+// schedule in the old constructor is expressed as an empty string.
+func mustRetryCalculator(t *testing.T, backoffSchedule string, maxAttempts int) *retry.Calculator {
+	t.Helper()
+	calculator, err := retry.NewCalculator(backoffSchedule, maxAttempts)
+	require.NoError(t, err)
+	require.NotNil(t, calculator)
+	return calculator
+}
 
 // ---------------------------------------------------------------------------
 // Silent logger for fanout tests
@@ -162,7 +174,7 @@ func TestFanOut_Process_NoHandlersRegistered(t *testing.T) {
 	}
 
 	// No handlers registered for "order.created"
-	fanout := NewFanOut(reg, repo, 3, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 3))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -204,7 +216,7 @@ func TestFanOut_Process_TwoProcessesBothOK(t *testing.T) {
 		{ID: "proc-2", EventID: "ev-1", ProcessName: "update-db", Status: domain.ProcessStatusPending, Attempts: 0},
 	}
 
-	fanout := NewFanOut(reg, repo, 3, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 3))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -260,8 +272,8 @@ func TestFanOut_Process_OneOKOneError_RetriesLeft(t *testing.T) {
 		{ID: "proc-2", EventID: "ev-1", ProcessName: "update-db", Status: domain.ProcessStatusPending, Attempts: 1},
 	}
 
-	schedule := []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second}
-	fanout := NewFanOut(reg, repo, 5, schedule)
+	calculator := mustRetryCalculator(t, "2s,5s,15s", 5)
+	fanout := NewFanOut(reg, repo, calculator)
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -285,7 +297,7 @@ func TestFanOut_Process_OneOKOneError_RetriesLeft(t *testing.T) {
 	assert.Equal(t, "db connection refused", call2.ErrorMsg)
 
 	// nextRetryAt ≈ now + schedule[1] = now + 5s
-	expectedBackoff := backoffFor(2, schedule)
+	expectedBackoff := calculator.ScheduleFor(2)
 	assert.Equal(t, 5*time.Second, expectedBackoff)
 	assertNextRetryAtApprox(t, expectedBackoff, call2.NextRetryAt, beforeCall)
 }
@@ -308,7 +320,7 @@ func TestFanOut_Process_MaxAttemptsReached_Dead(t *testing.T) {
 		{ID: "proc-1", EventID: "ev-1", ProcessName: "failing-handler", Status: domain.ProcessStatusFailed, Attempts: 4, NextRetryAt: nil},
 	}
 
-	fanout := NewFanOut(reg, repo, 5, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 5))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -353,7 +365,7 @@ func TestFanOut_Process_NextRetryAtFuture_Skipped(t *testing.T) {
 		{ID: "proc-1", EventID: "ev-1", ProcessName: "send-email", Status: domain.ProcessStatusFailed, Attempts: 1, NextRetryAt: &future},
 	}
 
-	fanout := NewFanOut(reg, repo, 3, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 3))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -384,7 +396,7 @@ func TestFanOut_Process_NextRetryAtNil_Executes(t *testing.T) {
 		{ID: "proc-1", EventID: "ev-1", ProcessName: "send-email", Status: domain.ProcessStatusFailed, Attempts: 0, NextRetryAt: nil},
 	}
 
-	fanout := NewFanOut(reg, repo, 3, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 3))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -418,7 +430,7 @@ func TestFanOut_Process_NextRetryAtPast_Executes(t *testing.T) {
 		{ID: "proc-1", EventID: "ev-1", ProcessName: "send-email", Status: domain.ProcessStatusFailed, Attempts: 1, NextRetryAt: &past},
 	}
 
-	fanout := NewFanOut(reg, repo, 3, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 3))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -451,8 +463,8 @@ func TestFanOut_Process_NoHandlerForProcessName(t *testing.T) {
 		{ID: "proc-2", EventID: "ev-1", ProcessName: "update-db", Status: domain.ProcessStatusPending, Attempts: 0},
 	}
 
-	schedule := []time.Duration{2 * time.Second}
-	fanout := NewFanOut(reg, repo, 3, schedule)
+	calculator := mustRetryCalculator(t, "2s", 3)
+	fanout := NewFanOut(reg, repo, calculator)
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -474,7 +486,7 @@ func TestFanOut_Process_NoHandlerForProcessName(t *testing.T) {
 	assert.Contains(t, call2.ErrorMsg, "no handler registered for process update-db")
 
 	// nextRetryAt must be set (backoff applied)
-	expectedBackoff := backoffFor(1, schedule)
+	expectedBackoff := calculator.ScheduleFor(1)
 	assertNextRetryAtApprox(t, expectedBackoff, call2.NextRetryAt, beforeCall)
 }
 
@@ -495,8 +507,8 @@ func TestFanOut_Process_PanicInFn_Recovered(t *testing.T) {
 		{ID: "proc-1", EventID: "ev-1", ProcessName: "panicking-handler", Status: domain.ProcessStatusPending, Attempts: 0},
 	}
 
-	schedule := []time.Duration{2 * time.Second}
-	fanout := NewFanOut(reg, repo, 3, schedule)
+	calculator := mustRetryCalculator(t, "2s", 3)
+	fanout := NewFanOut(reg, repo, calculator)
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -516,7 +528,7 @@ func TestFanOut_Process_PanicInFn_Recovered(t *testing.T) {
 	assert.LessOrEqual(t, len(call.ErrorMsg), 1024, "error message should have bounded stack trace")
 
 	// Backoff must be applied.
-	assertNextRetryAtApprox(t, backoffFor(1, schedule), call.NextRetryAt, beforeCall)
+	assertNextRetryAtApprox(t, calculator.ScheduleFor(1), call.NextRetryAt, beforeCall)
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +549,7 @@ func TestFanOut_Process_MaxAttemptsOne_FailsImmediately(t *testing.T) {
 		{ID: "proc-1", EventID: "ev-1", ProcessName: "failing-handler", Status: domain.ProcessStatusPending, Attempts: 0},
 	}
 
-	fanout := NewFanOut(reg, repo, 1, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 1))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -556,64 +568,36 @@ func TestFanOut_Process_MaxAttemptsOne_FailsImmediately(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Case k: backoffFor unit tests
-// ---------------------------------------------------------------------------
-
-func TestBackoffFor_Schedule(t *testing.T) {
-	schedule := []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second}
-
-	// Attempt 1 → schedule[0] (first entry)
-	assert.Equal(t, 2*time.Second, backoffFor(1, schedule))
-
-	// Attempt 2 → schedule[1]
-	assert.Equal(t, 5*time.Second, backoffFor(2, schedule))
-
-	// Attempt len(schedule) → last entry
-	assert.Equal(t, 60*time.Second, backoffFor(5, schedule))
-
-	// Attempt > len(schedule) → last entry (clamped)
-	assert.Equal(t, 60*time.Second, backoffFor(6, schedule))
-	assert.Equal(t, 60*time.Second, backoffFor(100, schedule))
-}
-
-func TestBackoffFor_EmptySchedule_Fallback(t *testing.T) {
-	// Empty schedule (nil or empty slice) → fallbackBackoff = 1s
-	assert.Equal(t, 1*time.Second, backoffFor(1, nil))
-	assert.Equal(t, 1*time.Second, backoffFor(1, []time.Duration{}))
-	assert.Equal(t, 1*time.Second, backoffFor(5, []time.Duration{}))
-}
-
-// ---------------------------------------------------------------------------
 // Case l: NewFanOut panics on invalid arguments
 // ---------------------------------------------------------------------------
 
 func TestNewFanOut_Panics_RegistryNil(t *testing.T) {
 	repo := newFakeFanOutRepo()
 	assert.PanicsWithValue(t, "workers: registry must not be nil", func() {
-		NewFanOut(nil, repo, 3, nil)
+		NewFanOut(nil, repo, mustRetryCalculator(t, "", 3))
 	})
 }
 
 func TestNewFanOut_Panics_RepoNil(t *testing.T) {
 	reg := dispatch.NewRegistry()
 	assert.PanicsWithValue(t, "workers: repo must not be nil", func() {
-		NewFanOut(reg, nil, 3, nil)
+		NewFanOut(reg, nil, mustRetryCalculator(t, "", 3))
 	})
 }
 
-func TestNewFanOut_Panics_MaxAttemptsZero(t *testing.T) {
+func TestNewFanOut_Panics_CalculatorNil(t *testing.T) {
 	reg := dispatch.NewRegistry()
 	repo := newFakeFanOutRepo()
-	assert.PanicsWithValue(t, "workers: maxAttempts must be at least 1", func() {
-		NewFanOut(reg, repo, 0, nil)
+	assert.PanicsWithValue(t, "workers: calculator must not be nil", func() {
+		NewFanOut(reg, repo, nil)
 	})
 }
 
 func TestNewFanOut_Success(t *testing.T) {
 	reg := dispatch.NewRegistry()
 	repo := newFakeFanOutRepo()
-	schedule := []time.Duration{2 * time.Second}
-	fanout := NewFanOut(reg, repo, 5, schedule)
+	calculator := mustRetryCalculator(t, "2s", 5)
+	fanout := NewFanOut(reg, repo, calculator)
 	assert.NotNil(t, fanout)
 }
 
@@ -632,7 +616,7 @@ func TestFanOut_Process_EmptyPending_ReturnsNil(t *testing.T) {
 
 	repo := newFakeFanOutRepo()
 	// No processes configured for this event ID → empty slice.
-	fanout := NewFanOut(reg, repo, 3, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 3))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -656,7 +640,7 @@ func TestFanOut_Process_RepoFetchError_Propagates(t *testing.T) {
 
 	repo := newFakeFanOutRepo()
 	repo.fetchError = errors.New("database connection lost")
-	fanout := NewFanOut(reg, repo, 3, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 3))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
@@ -692,7 +676,7 @@ func TestFanOut_Process_ConcurrentEvents_NoRace(t *testing.T) {
 		}},
 	})
 
-	schedule := []time.Duration{2 * time.Second}
+	calculator := mustRetryCalculator(t, "2s", 5)
 
 	// Properly set up the repo's processesByEventID BEFORE creating the FanOut
 	eventCount := 30
@@ -704,7 +688,7 @@ func TestFanOut_Process_ConcurrentEvents_NoRace(t *testing.T) {
 			{ID: fmt.Sprintf("proc-b-%d", i+1), EventID: eventID, ProcessName: "update-db", Status: domain.ProcessStatusPending, Attempts: 0},
 		}
 	}
-	fanout2 := NewFanOut(reg, repo, 5, schedule)
+	fanout2 := NewFanOut(reg, repo, calculator)
 
 	ctx := silentCtxFanout()
 
@@ -751,7 +735,7 @@ func TestFanOut_Process_DeadAndSkipped_DeadLetterWins(t *testing.T) {
 		{ID: "proc-2", EventID: "ev-1", ProcessName: "backoff-handler", Status: domain.ProcessStatusFailed, Attempts: 1, NextRetryAt: &future},
 	}
 
-	fanout := NewFanOut(reg, repo, 5, nil)
+	fanout := NewFanOut(reg, repo, mustRetryCalculator(t, "", 5))
 	ctx := silentCtxFanout()
 	event := domain.Event{ID: "ev-1", Type: "order.created"}
 
