@@ -46,3 +46,11 @@ status: active
 **Ámbito**: internal/config/config.go + internal/config/config_test.go.
 **Alternativas**: Cambiar el test a 150s (rompía la spec T02).
 **Ejemplo**: config.Load() sin env → ShutdownTimeout == 30 * time.Second.
+
+## Regla 6: Logging de operaciones admin: estado anterior + resultado
+**Contexto**: El handler POST /admin/events/{id}/requeue (T14) introdujo el patrón de operaciones administrativas sobre eventos: loguear el resultado con el estado previo. Antes, solo los errores se logueaban y el éxito quedaba invisible en los logs.
+**Decisión**: Toda operación admin sobre un evento (ej: requeue, dead-letter, shutdown) debe loguear SIEMPRE su desenlace con slog estructurado: campos `event_id`, `previous_status` (estado previo a la operación, tomado del struct en memoria ANTES de la mutación en DB), `result` ("ok" | "rejected" | "error"), y `request_id`. Nivel: Info para éxito, Warn para rechazos de negocio (409), Error para fallos internos (500).
+**Motivo**: Observabilidad de acciones administrativas: cada intento queda rastreable con request_id + event_id + resultado, discriminando rejected vs ok vs error. El struct local conserva el estado previo porque la mutación ocurre en DB, no en memoria.
+**Ámbito**: Handlers de /admin/* en internal/httpapi (requeueEvent es la referencia: handlers.go líneas 242-274).
+**Alternativas**: Loguear solo errores (éxito invisible, como antes de T14); loguear sin estado previo (no se puede correlacionar el cambio).
+**Ejemplo**: logger.Info("event requeued", "event_id", eventID, "previous_status", event.Status, "result", "ok", "request_id", requestID)

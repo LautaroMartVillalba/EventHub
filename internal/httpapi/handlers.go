@@ -240,6 +240,12 @@ func (server *Server) requeueEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if event.Status != domain.StatusDead {
+		logger.Warn("requeue rejected",
+			"event_id", eventID,
+			"previous_status", event.Status,
+			"result", "rejected",
+			"request_id", requestID,
+		)
 		writeError(w, http.StatusConflict,
 			fmt.Sprintf("event %q has status %q; only dead events can be requeued", eventID, event.Status))
 		return
@@ -260,5 +266,11 @@ func (server *Server) requeueEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	logger.Info("event requeued",
+		"event_id", eventID,
+		"previous_status", event.Status,
+		"result", "ok",
+		"request_id", requestID,
+	)
 	w.WriteHeader(http.StatusNoContent)
 }
